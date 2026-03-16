@@ -1866,13 +1866,17 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
 
                     # Read only unpinned experts from disk
                     if _packed_comps is not None and i in packed_layers:
-                        # PACKED PATH: separated I/O (threaded) then conversion (serial)
+                        # PACKED PATH: pipelined I/O + conversion
+                        # Submit all reads non-blocking, then process as
+                        # each completes — conversion of expert N overlaps
+                        # with pread of experts N+1..N+K (GIL released
+                        # during pread syscall).
                         packed_fd = packed_fds[i]
                         es = packed_layout["expert_size"]
-                        def _just_read(eidx):
-                            return eidx, os.pread(packed_fd, es, eidx * es)
-                        raw_buffers = list(_io_pool.map(_just_read, unpinned_list))
-                        for eidx, raw in raw_buffers:
+                        read_futures = {eidx: _io_pool.submit(os.pread, packed_fd, es, eidx * es)
+                                        for eidx in unpinned_list}
+                        for eidx in unpinned_list:
+                            raw = read_futures[eidx].result()
                             mv = memoryview(raw)
                             attrs = {}
                             for proj, attr, off, sz, npdtype, shape, is_bf16 in _packed_comps:
