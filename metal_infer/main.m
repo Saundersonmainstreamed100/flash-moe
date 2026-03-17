@@ -1340,8 +1340,7 @@ static FullForwardTiming run_full_forward(
         // Actually the cleanest fix: have encode_expert_compute take an output offset
         // For now: allocate per-k expert_out buffers and copy after ONE commit
 
-        // REVERT to per-expert commit for correctness (optimize in next iteration)
-        // The real fix needs encode_expert_compute to support output offset
+        // All K experts in ONE command buffer
         for (int k = 0; k < K; k++) {
             encode_expert_compute(ctx, cmdbuf, cur_bufs[k],
                                   h_buf, per_k_gate[k], per_k_up[k], per_k_act[k],
@@ -1351,19 +1350,26 @@ static FullForwardTiming run_full_forward(
         [cmdbuf commit];
         [cmdbuf waitUntilCompleted];
 
-        // Copy all K expert outputs into stacked buffer
+        // CPU memcpy into stacked (faster than GPU blit for 64KB)
         for (int k = 0; k < K; k++) {
             memcpy((float *)[stacked contents] + k * HIDDEN_DIM,
                    [per_k_out[k] contents],
                    HIDDEN_DIM * sizeof(float));
         }
 
-        // Weighted sum: combine K expert outputs -> moe_out
-        cmdbuf = [ctx->queue commandBuffer];
-        encode_weighted_sum(ctx, cmdbuf, stacked, w_buf, moe_out, (uint32_t)K);
-
-        [cmdbuf commit];
-        [cmdbuf waitUntilCompleted];
+        // Weighted sum on CPU (4 × 4096 floats = trivial, avoids extra cmd buffer)
+        {
+            float *moe = (float *)[moe_out contents];
+            float *w = (float *)[w_buf contents];
+            memset(moe, 0, HIDDEN_DIM * sizeof(float));
+            for (int k = 0; k < K; k++) {
+                float *ek = (float *)[per_k_out[k] contents];
+                float wk = w[k];
+                for (int d = 0; d < HIDDEN_DIM; d++) {
+                    moe[d] += ek[d] * wk;
+                }
+            }
+        }
 
         // Accumulate residual: h = h + moe_out
         float *h = (float *)[h_buf contents];
