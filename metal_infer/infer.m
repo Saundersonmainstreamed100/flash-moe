@@ -4132,6 +4132,19 @@ int main(int argc, char **argv) {
         }
         printf("[experts] %d/%d packed layer files available\n", expert_layers_available, NUM_LAYERS);
 
+        // Pre-warm page cache: read first few experts per layer to trigger readahead
+        if (expert_layers_available > 0) {
+            double t_warm = now_ms();
+            char dummy[4096];
+            for (int i = 0; i < NUM_LAYERS; i++) {
+                if (layer_fds[i] >= 0) {
+                    // Read first 4KB of each layer file to trigger OS readahead
+                    pread(layer_fds[i], dummy, sizeof(dummy), 0);
+                }
+            }
+            printf("[warmup] Page cache hint: %.1f ms\n", now_ms() - t_warm);
+        }
+
         // ---- Allocate per-layer state ----
         void **layer_states = calloc(NUM_LAYERS, sizeof(void *));
         KVCache **kv_caches = calloc(NUM_LAYERS, sizeof(KVCache *));
